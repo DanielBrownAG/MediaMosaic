@@ -71,6 +71,7 @@ ProjectPhotos-4.jpg
 
 Examples:
 
+
 * 87 files = 1 sheet
 * 200 files = 1 sheet
 * 201 files = 2 sheets
@@ -82,6 +83,8 @@ This prevents extremely large output images while maintaining readability and pe
 ---
 
 ## Example Output
+
+![Example](ContactImageSheet-1.jpg)
 
 ```text
 ProjectPhotos-1.jpg - 200 Files

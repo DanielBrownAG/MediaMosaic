@@ -4,7 +4,7 @@ Add-Type -AssemblyName System.Drawing
 # SETTINGS
 # ======================================
 
-$RootFolder = "C:\Path\To\Images"
+$RootFolder = "D:\OneDrive\Archon Mining\Arckaringa Basin Project 1 - Documents\Media\Daniel"
 $OutputFile = "C:\Temp\ContactImageSheet.jpg"
 
 $FFmpeg = "C:\Tools\ffmpeg\ffmpeg.exe"
