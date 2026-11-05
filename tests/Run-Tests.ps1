@@ -53,6 +53,77 @@ function New-FFmpegFixture([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "Fixture creation failed: $messages" }
 }
 
+function New-TestDecoder {
+    $folder = New-TestFolder 'decoder [stub]'
+    $source = Join-Path $folder 'Decoder.cs'
+    $executable = Join-Path $folder 'Decoder.exe'
+    @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Diagnostics;
+class Decoder {
+    static int Main(string[] args) {
+        if (args[0] == "--echo") {
+            for (int i = 1; i < args.Length; i++)
+                Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(args[i])));
+            return 0;
+        }
+        string input = args[Array.IndexOf(args, "-i") + 1];
+        string mode = File.ReadAllText(input).Trim();
+        File.WriteAllText(input + ".pid", Process.GetCurrentProcess().Id.ToString());
+        if (mode == "diagnostics") {
+            Console.Error.Write(new string('e', 131072));
+            Console.Out.Write(new string('o', 131072));
+            return 17;
+        }
+        if (mode == "fallback") {
+            string seek = args[Array.IndexOf(args, "-ss") + 1];
+            Thread.Sleep(600);
+            if (seek != "3")
+                File.Copy(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "frame.png"), args[args.Length - 1]);
+            return 0;
+        }
+        File.WriteAllText(args[args.Length - 1], "partial frame");
+        Thread.Sleep(30000);
+        return 0;
+    }
+}
+'@ | Set-Content -LiteralPath $source -Encoding UTF8
+    $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $messages = & $compiler /nologo /target:exe "/out:$executable" $source 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "Could not compile decoder fixture: $messages" }
+    $frame = [Drawing.Bitmap]::new(16, 16)
+    try { $frame.Save((Join-Path $folder 'frame.png'), [Drawing.Imaging.ImageFormat]::Png) }
+    finally { $frame.Dispose() }
+    return $executable
+}
+
+function Assert-DecoderStopped([string]$InputPath) {
+    $decoderPid = [int](Get-Content -LiteralPath ($InputPath + '.pid'))
+    Assert-True ($null -eq (Get-Process -Id $decoderPid -ErrorAction SilentlyContinue)) 'Timed-out decoder was terminated'
+}
+
+function Start-ProgressCapture {
+    & $module {
+        $script:CapturedProgress = [Collections.Generic.List[hashtable]]::new()
+        function script:Write-Progress {
+            param($Id, $Activity, $Status, $CurrentOperation, $PercentComplete, [switch]$Completed)
+            $script:CapturedProgress.Add(@{
+                Id = $Id; Activity = $Activity; Status = $Status; CurrentOperation = $CurrentOperation
+                PercentComplete = $PercentComplete; Completed = [bool]$Completed
+            })
+        }
+    }
+}
+function Stop-ProgressCapture {
+    & $module {
+        Remove-Item Function:Write-Progress
+        Remove-Variable -Name CapturedProgress -Scope Script
+    }
+}
+
 try {
     Test-Case 'JPEG renders, nested output is created, and resources are released' {
         $inputPath = New-TestFolder 'basic'
@@ -156,12 +227,125 @@ try {
     }
     Test-Case 'invalid numeric options and output extensions are rejected' {
         $inputPath = New-TestFolder 'invalid-options'
-        foreach ($option in @('FilesPerSheet', 'Columns', 'ThumbWidth', 'ThumbHeight', 'HeaderHeight', 'TextHeight')) {
+        foreach ($option in @('FilesPerSheet', 'Columns', 'ThumbWidth', 'ThumbHeight', 'HeaderHeight', 'TextHeight', 'FFmpegTimeoutSeconds')) {
             $options = @{}; $options[$option] = 0
             Assert-Throws { Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg') $options }
         }
         Assert-Throws { Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg') @{ Padding = -1 } }
         Assert-Throws { Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.png') } 'extension'
+        Assert-Throws { Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg') @{ FFmpegTimeoutSeconds = 3601 } }
+    }
+    Test-Case 'progress reports files across sheets, counts failed previews, and completes' {
+        $inputPath = New-TestFolder 'progress'
+        New-TestImage (Join-Path $inputPath 'a.jpg')
+        Set-Content -LiteralPath (Join-Path $inputPath 'b.jpg') -Value 'invalid image'
+        Start-ProgressCapture
+        try {
+            $result = Invoke-MediaMosaic -RootFolder $inputPath -OutputFile (Join-Path $inputPath 'sheet.jpg') -FilesPerSheet 1 -WarningAction SilentlyContinue
+            $events = @(& $module { $script:CapturedProgress.ToArray() })
+            Assert-True ($events[0].Status -match 'Scanning media') 'Discovery progress'
+            Assert-True (@($events | Where-Object CurrentOperation -eq 'a.jpg').Count -gt 0) 'Current filename reported'
+            Assert-True (@($events | Where-Object Status -match 'Sheet 2/2.*2/2 processed.*elapsed').Count -gt 0) 'Global counts include failure and elapsed time'
+            Assert-True (@($events | Where-Object Status -match 'Publishing outputs').Count -gt 0) 'Publishing stage reported'
+            Assert-True ($events[-1].Completed -and $result.Failed -eq 1) 'Progress completed after partial failure'
+            $percents = @($events | Where-Object { -not $_.Completed -and $_.PercentComplete -ge 0 } | ForEach-Object { $_.PercentComplete })
+            for ($i = 1; $i -lt $percents.Count; $i++) {
+                Assert-True ($percents[$i] -ge $percents[$i - 1] -and $percents[$i] -le 99) 'Progress remains monotonic until publishing completes'
+            }
+        }
+        finally { Stop-ProgressCapture }
+    }
+    Test-Case 'progress clears on fatal errors and empty inputs, and NoProgress suppresses it' {
+        $inputPath = New-TestFolder 'progress-completion'
+        Start-ProgressCapture
+        try {
+            Assert-Throws { Invoke-TestMosaic (Join-Path $testRoot 'absent') (Join-Path $inputPath 'sheet.jpg') }
+            Assert-True (& $module { $script:CapturedProgress[$script:CapturedProgress.Count - 1].Completed }) 'Cleared after fatal error'
+            & $module { $script:CapturedProgress.Clear() }
+            $empty = Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg')
+            Assert-True ($empty.Discovered -eq 0) 'Empty input completes normally'
+            Assert-True (& $module { $script:CapturedProgress[$script:CapturedProgress.Count - 1].Completed }) 'Cleared after empty input'
+            & $module { $script:CapturedProgress.Clear() }
+            New-TestImage (Join-Path $inputPath 'photo.jpg')
+            $result = Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg') @{ NoProgress = $true }
+            Assert-True ($result.Rendered -eq 1) 'Suppression does not affect rendering'
+            Assert-True ((& $module { $script:CapturedProgress.Count }) -eq 0) 'No progress events when suppressed'
+        }
+        finally { Stop-ProgressCapture }
+    }
+    $decoder = New-TestDecoder
+    Test-Case 'elapsed progress refreshes while a decoder is still running' {
+        $inputPath = New-TestFolder 'progress-decoder'
+        $source = Join-Path $inputPath 'hang.webp'; Set-Content -LiteralPath $source -Value 'hang'
+        Start-ProgressCapture
+        try {
+            $result = Invoke-MediaMosaic -RootFolder $inputPath -OutputFile (Join-Path $inputPath 'sheet.jpg') -FFmpeg $decoder -FFmpegTimeoutSeconds 2 -WarningAction SilentlyContinue
+            $events = @(& $module { $script:CapturedProgress.ToArray() })
+            Assert-True (@($events | Where-Object { $_.CurrentOperation -eq 'hang.webp' -and
+                $_.Status -match '0/1 processed.*[12]s elapsed' }).Count -gt 0) 'Progress refreshed before the file finished'
+            Assert-True ($events[-1].Completed -and $result.Failed -eq 1) 'Timeout still completes the progress display'
+            Assert-DecoderStopped $source
+        }
+        finally { Stop-ProgressCapture }
+    }
+    Test-Case 'native arguments preserve quotes, spaces, Unicode, empty strings and trailing backslashes' {
+        $arguments = @('space text', 'a"b', '', 'trailing\', 'quote\"after', "Unicode $([char]0x03A9)")
+        $result = & $module {
+            param($Executable, $Values)
+            Invoke-FFmpegProcess -Executable $Executable -Arguments (@('--echo') + $Values) -TimeoutMilliseconds 5000
+        } $decoder $arguments
+        $encoded = $result.Diagnostic -split '\r?\n'
+        Assert-True ($result.ExitCode -eq 0 -and $encoded.Count -eq $arguments.Count) 'Native argument count preserved'
+        for ($i = 0; $i -lt $arguments.Count; $i++) {
+            Assert-True ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded[$i])) -ceq $arguments[$i]) "Argument $i round trips"
+        }
+    }
+    Test-Case 'large native stderr and stdout do not deadlock and retain diagnostics' {
+        $inputPath = New-TestFolder 'pipes'
+        $source = Join-Path $inputPath 'diagnostics.webp'; Set-Content -LiteralPath $source -Value 'diagnostics'
+        $result = & $module { param($Executable, $Source)
+            Invoke-FFmpegProcess -Executable $Executable -Arguments @('-i', $Source) -TimeoutMilliseconds 5000
+        } $decoder $source
+        Assert-True ($result.ExitCode -eq 17 -and $result.Diagnostic.Contains(('e' * 131072)) -and
+            $result.Diagnostic.Contains(('o' * 131072))) 'Both pipes drained without losing nonzero exit code'
+    }
+    Test-Case 'timeout terminates the decoder and removes its partial temporary image' {
+        $inputPath = New-TestFolder 'timeout-cleanup'
+        $source = Join-Path $inputPath 'hang.mp4'; Set-Content -LiteralPath $source -Value 'hang'
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        Assert-Throws { & $module { param($Source, $Executable, $TemporaryFolder)
+            Get-FFmpegPreview -Path $Source -FFmpeg $Executable -Video -FFmpegTimeoutSeconds 1 -TemporaryFolder $TemporaryFolder
+        } $source $decoder $inputPath } 'timed out'
+        Assert-True ($clock.Elapsed.TotalSeconds -lt 8) 'Decoder does not sleep for 30 seconds'
+        Assert-DecoderStopped $source
+        Assert-True (@(Get-ChildItem -LiteralPath $inputPath -Filter '*.png').Count -eq 0) 'Partial frame removed'
+    }
+    Test-Case 'video fallback shares the original time budget' {
+        $inputPath = New-TestFolder 'timeout-fallback'
+        $source = Join-Path $inputPath 'fallback.mp4'; Set-Content -LiteralPath $source -Value 'fallback'
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        Assert-Throws { & $module { param($Source, $Executable)
+            Get-FFmpegPreview -Path $Source -FFmpeg $Executable -Video -FFmpegTimeoutSeconds 1
+        } $source $decoder } 'timed out'
+        Assert-True ($clock.Elapsed.TotalSeconds -lt 5) 'Fallback timeout returns promptly'
+        Assert-DecoderStopped $source
+        # Each attempt takes 600 ms. Renewing the one-second budget would
+        # incorrectly succeed, while the shared budget must time out.
+        $preview = & $module { param($Source, $Executable)
+            Get-FFmpegPreview -Path $Source -FFmpeg $Executable -Video -FFmpegTimeoutSeconds 3
+        } $source $decoder
+        try { Assert-True ($preview.Width -eq 16) 'The same fallback succeeds with a sufficient shared budget' }
+        finally { $preview.Dispose() }
+    }
+    Test-Case 'CLI propagates the timeout and continues rendering after a stalled WebP decoder' {
+        $inputPath = New-TestFolder 'timeout-continue'
+        $source = Join-Path $inputPath 'a.webp'; Set-Content -LiteralPath $source -Value 'hang'
+        New-TestImage (Join-Path $inputPath 'b.jpg')
+        $result = & (Join-Path $repo 'MediaMosaic.ps1') -RootFolder $inputPath -OutputFile (Join-Path $inputPath 'sheet.jpg') -FFmpeg $decoder -FFmpegTimeoutSeconds 1 -NoProgress -WarningAction SilentlyContinue
+        $records = @(Import-Csv -LiteralPath $result.IndexPath)
+        Assert-True ($result.Rendered -eq 1 -and $result.Failed -eq 1) 'Run continued to the next file'
+        Assert-True ($records[0].Error -match 'timed out' -and $records[1].Status -eq 'Rendered') 'Timeout retained in CSV'
+        Assert-DecoderStopped $source
     }
     Test-Case 'relative CSV captions distinguish duplicate filenames and pagination keeps the last file' {
         $inputPath = New-TestFolder 'duplicates'

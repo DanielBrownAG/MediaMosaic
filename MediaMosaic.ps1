@@ -10,6 +10,8 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RootFolder,
     [ValidateNotNullOrEmpty()][string]$OutputFile = 'MediaMosaic.jpg',
     [ValidateNotNullOrEmpty()][string]$FFmpeg = 'ffmpeg',
+    [ValidateRange(1, 3600)][int]$FFmpegTimeoutSeconds = 30,
+    [switch]$NoProgress,
     [ValidateRange(1, 100000)][int]$FilesPerSheet = 200,
     [ValidateRange(1, 1000)][int]$Columns = 4,
     [ValidateRange(1, 10000)][int]$ThumbWidth = 250,
