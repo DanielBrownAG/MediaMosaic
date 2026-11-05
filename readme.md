@@ -14,6 +14,8 @@ collections are split into numbered sheets, with 200 files per sheet by default.
 Use it to review project photography, audit mixed media collections, or prepare
 a visual index for dataset review. Each run produces numbered JPEG sheets, a
 CSV index, and a manifest for cleaning up obsolete sheets on subsequent runs.
+Thumbnail caching is enabled by default to speed up repeat reviews of unchanged
+collections, including video and WebP previews that would otherwise need FFmpeg.
 
 ## Quick start
 
@@ -72,6 +74,9 @@ while generated sheets always use `.jpg`.
 | `FFmpeg` | `ffmpeg` | Executable name on PATH or full executable path |
 | `FFmpegTimeoutSeconds` | `30` | Shared FFmpeg time budget per video or WebP preview, including video fallback; 1–3,600 seconds |
 | `NoProgress` | Off | Suppress progress reporting for scripts, logs, or CI |
+| `CacheFolder` | `.mediamosaic-cache` inside the output directory | Dedicated folder for reusable PNG thumbnails |
+| `NoCache` | Off | Bypass cache reads and writes; overrides `RefreshCache` |
+| `RefreshCache` | Off | Rebuild previews for the current inputs instead of reading existing entries |
 | `FilesPerSheet` | `200` | Maximum input files per sheet; 1–100,000 |
 | `Columns` | `4` | Grid columns; 1–1,000 |
 | `ThumbWidth` | `250` | Thumbnail box width in pixels; 1–10,000 |
@@ -112,6 +117,58 @@ caption with a **PREVIEW FAILED** placeholder. Missing FFmpeg affects only media
 that require it. Each failed preview emits a warning with the path and error;
 processing continues. Headers show separate rendered and failed counts.
 Files with extensions outside the supported list are ignored during discovery.
+
+## Thumbnail caching
+
+By default, previews are saved as scaled, aspect-fitted PNGs in
+`.mediamosaic-cache` alongside the output sheets. A warm run reuses these images
+without decoding the original media again. Sheets, headers, captions, and the CSV
+are still regenerated, so changes to pagination or layout take effect immediately.
+
+Cache keys include the source's absolute path, byte size, UTC modification time,
+thumbnail width/height, and a preview-pipeline version. Video and WebP keys also
+include the configured `FFmpeg` string. Source metadata is refreshed for each
+lookup. Changes to any of those fields create a cache miss. Layout-only changes,
+such as columns, padding, or sheet size, and changes to the FFmpeg timeout reuse
+existing previews. Failed previews are never cached and are retried on later runs.
+
+```powershell
+# Share a dedicated cache across output locations; paths are treated literally.
+.\MediaMosaic.ps1 -RootFolder 'D:\Photos' -OutputFile '.\Review\Project.jpg' -CacheFolder 'D:\ThumbnailCache'
+
+# Rebuild current entries after changing a decoder or replacing source content.
+.\MediaMosaic.ps1 -RootFolder 'D:\Photos' -OutputFile '.\Review\Project.jpg' -RefreshCache
+
+# Decode directly without reading, writing, or creating a cache.
+.\MediaMosaic.ps1 -RootFolder 'D:\Photos' -OutputFile '.\Review\Project.jpg' -NoCache
+```
+
+The default cache and the selected custom cache are excluded from media discovery,
+even with `-NoCache`. They are pruned before directory traversal, so cached PNGs
+never become source media. Use a dedicated cache directory: it must not equal or
+contain the source root or output directory. Discovery does not follow nested
+directory junctions or symbolic links into other trees.
+
+Corrupt or unreadable cache entries are rebuilt. A cache initialization or write
+error emits a warning and allows readable source media to render normally.
+Entries are written through unique temporary files and replaced only after the
+PNG is saved. Source images and cache files are released after use. If the source
+metadata changes during decoding, that preview is not saved under the old key.
+
+Invalidation uses metadata rather than hashing all source bytes. If content is
+changed while preserving both size and modification time, use `-RefreshCache`.
+Also refresh after replacing FFmpeg in place or changing its version without
+changing the `FFmpeg` argument; its executable contents are not part of the key.
+Original media must still exist and be accessible for discovery and metadata
+checks, even when a cached preview is available.
+
+Old entries from edited, moved, or deleted inputs and previous thumbnail sizes
+are retained; there is no automatic size limit or eviction policy. `-RefreshCache`
+rebuilds current entries and does not purge unrelated or obsolete entries. You
+can remove the dedicated cache directory between runs to reclaim space; the next
+run rebuilds it. Cached thumbnails can contain private source imagery, so choose
+a cache location with appropriate access. The default cache directory is ignored
+by this repository's `.gitignore`.
 
 ## Progress reporting
 
@@ -196,10 +253,11 @@ base. Keep the manifest alongside the sheets for reliable cleanup.
 | No files are discovered | Check the source path and supported extensions. Generated numbered sheets in the output directory are deliberately excluded. |
 | Canvas is too large | Reduce `FilesPerSheet`, `Columns`, or thumbnail dimensions. |
 | A rerun leaves old pages | Only surplus pages recorded in the manifest are removed. Outputs from the original version may need manual cleanup. |
+| A thumbnail looks stale | Use `-RefreshCache`, especially after metadata-preserving edits or an in-place decoder upgrade. |
+| Cache warnings appear | Verify that `CacheFolder` is a writable dedicated directory, or use `-NoCache`. Source rendering continues when the cache cannot be written. |
 
-The current implementation processes files sequentially and regenerates previews
-on each run. Thumbnail caching, filters, an HTML gallery, and video storyboards
-are not implemented.
+The current implementation processes files sequentially. Filters, an HTML gallery,
+and video storyboards are not implemented.
 
 ## Automation
 
@@ -209,6 +267,7 @@ The script returns one summary object:
 $result = .\MediaMosaic.ps1 -RootFolder 'D:\Photos' -OutputFile '.\Review\Project.jpg'
 $result | Format-List
 # Discovered, Rendered, Failed, Sheets, IndexPath, ManifestPath
+# CacheFolder, CacheHits, CacheMisses
 
 if ($result.Failed -gt 0) {
     Write-Error "$($result.Failed) previews failed; inspect $($result.IndexPath)"
@@ -220,6 +279,9 @@ CSV; they do not fail the whole run. Fatal errors, such as a missing source,
 invalid options, or an output write failure, terminate processing. When invoked
 with `powershell.exe -File` or `pwsh -File`, fatal errors return a nonzero process
 exit code. Use `Failed` to enforce stricter acceptance of partial results.
+`CacheHits` counts successful reuse; `CacheMisses` counts attempted cache lookups
+that require decoding, including inputs whose previews fail. Both counters are
+zero and `CacheFolder` is null when caching is disabled for the run.
 
 The reusable module exports `Invoke-MediaMosaic` with the same parameters:
 
@@ -230,7 +292,7 @@ Invoke-MediaMosaic -RootFolder 'D:\Photos' -OutputFile '.\Review\Project.jpg'
 
 ## Tests
 
-The 29-case regression suite requires no Pester installation or downloaded test packages.
+The 40-case regression suite requires no Pester installation or downloaded test packages.
 It creates its own fixtures in a unique temporary directory and removes them
 afterwards. FFmpeg integration tests generate real videos and WebP images.
 Timeout tests compile a small decoder fixture with the .NET Framework C# compiler
@@ -256,6 +318,10 @@ It also covers timeout validation and propagation, a shared fallback budget,
 decoder termination, temporary-file cleanup after timeout, native argument
 escaping, full output pipes, progress updates during decoding, and progress
 completion/suppression.
+Cache coverage includes cold/warm runs, identical output on reuse, independent
+timestamp and size invalidation, thumbnail settings, custom literal paths, source
+exclusion, refresh/bypass controls, corrupt entries, cache errors, unlocked files,
+decoder bypass/invalidation, and recovery after failed source previews.
 
 [GitHub Actions](https://github.com/DanielBrownAG/MediaMosaic/actions/workflows/tests.yml)
 runs the full suite on every push and pull request, and supports manual runs.

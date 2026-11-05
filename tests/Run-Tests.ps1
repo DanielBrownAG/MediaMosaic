@@ -73,6 +73,10 @@ class Decoder {
         string input = args[Array.IndexOf(args, "-i") + 1];
         string mode = File.ReadAllText(input).Trim();
         File.WriteAllText(input + ".pid", Process.GetCurrentProcess().Id.ToString());
+        if (mode == "success") {
+            File.Copy(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "frame.png"), args[args.Length - 1]);
+            return 0;
+        }
         if (mode == "diagnostics") {
             Console.Error.Write(new string('e', 131072));
             Console.Out.Write(new string('o', 131072));
@@ -274,6 +278,154 @@ try {
         finally { Stop-ProgressCapture }
     }
     $decoder = New-TestDecoder
+    Test-Case 'cache stores scaled PNGs, reuses them, and releases source/cache locks' {
+        $inputPath = New-TestFolder 'cache-basic'
+        $source = Join-Path $inputPath 'large.jpg'; New-TestImage $source 800 600
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $cold = Invoke-TestMosaic $inputPath $output
+        Assert-True ($cold.CacheHits -eq 0 -and $cold.CacheMisses -eq 1) 'Cold run counts'
+        $entries = @(Get-ChildItem -LiteralPath $cold.CacheFolder -File)
+        Assert-True ($entries.Count -eq 1 -and $entries[0].Name -match '^[a-f0-9]{64}\.png$') 'Hashed PNG cache entry'
+        $image = [Drawing.Image]::FromFile($entries[0].FullName)
+        try { Assert-True ($image.Width -eq 240 -and $image.Height -eq 180) 'Cache stores an aspect-fitted thumbnail, not a full-size image' }
+        finally { $image.Dispose() }
+        $before = (Get-FileHash -LiteralPath $cold.Sheets[0]).Hash
+        $warm = Invoke-TestMosaic $inputPath $output
+        Assert-True ($warm.Discovered -eq 1 -and $warm.CacheHits -eq 1 -and $warm.CacheMisses -eq 0) 'Cache is reused and never becomes input'
+        Assert-True ((Get-FileHash -LiteralPath $warm.Sheets[0]).Hash -eq $before) 'Warm and cold sheets have identical pixels/encoding'
+        Assert-Unlocked $source; Assert-Unlocked $entries[0].FullName
+    }
+    Test-Case 'source timestamp and size changes independently invalidate the cache' {
+        $inputPath = New-TestFolder 'cache-metadata'
+        $source = Join-Path $inputPath 'photo.jpg'; New-TestImage $source
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $first = Invoke-TestMosaic $inputPath $output
+        $timestamp = [IO.File]::GetLastWriteTimeUtc($source).AddSeconds(10)
+        [IO.File]::SetLastWriteTimeUtc($source, $timestamp)
+        $changedTime = Invoke-TestMosaic $inputPath $output
+        Assert-True ($changedTime.CacheHits -eq 0 -and $changedTime.CacheMisses -eq 1) 'Timestamp invalidation'
+        $stream = [IO.File]::OpenWrite($source)
+        try { [void]$stream.Seek(0, [IO.SeekOrigin]::End); $stream.WriteByte(0) }
+        finally { $stream.Dispose() }
+        [IO.File]::SetLastWriteTimeUtc($source, $timestamp)
+        $changedSize = Invoke-TestMosaic $inputPath $output
+        Assert-True ($changedSize.Rendered -eq 1 -and $changedSize.CacheHits -eq 0 -and $changedSize.CacheMisses -eq 1) 'Size invalidation even with identical timestamp'
+    }
+    Test-Case 'thumbnail dimensions invalidate entries while layout-only changes reuse them' {
+        $inputPath = New-TestFolder 'cache-settings'
+        New-TestImage (Join-Path $inputPath 'photo.jpg')
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $cold = Invoke-TestMosaic $inputPath $output
+        $dimensions = Invoke-TestMosaic $inputPath $output @{ ThumbWidth = 200; ThumbHeight = 120 }
+        Assert-True ($dimensions.CacheHits -eq 0 -and $dimensions.CacheMisses -eq 1) 'New dimensions require new preview'
+        $layout = Invoke-TestMosaic $inputPath $output @{ ThumbWidth = 200; ThumbHeight = 120; Columns = 2; Padding = 20; FFmpegTimeoutSeconds = 45 }
+        Assert-True ($layout.CacheHits -eq 1 -and $layout.CacheMisses -eq 0) 'Layout and timeout do not change preview pixels'
+    }
+    Test-Case 'custom literal cache folders and the default cache are excluded from discovery' {
+        $inputPath = New-TestFolder 'cache-custom'
+        New-TestImage (Join-Path $inputPath 'photo.jpg')
+        $custom = Join-Path $inputPath "thumbs[1] O'Brien"
+        [IO.Directory]::CreateDirectory($custom) | Out-Null
+        New-TestImage (Join-Path $custom 'unrelated.jpg')
+        $default = Join-Path $inputPath '.mediamosaic-cache'
+        [IO.Directory]::CreateDirectory($default) | Out-Null
+        New-TestImage (Join-Path $default 'old.jpg')
+        $result = Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg') @{ CacheFolder = $custom }
+        Assert-True ($result.Discovered -eq 1 -and $result.CacheFolder -eq $custom) 'Both cache roots excluded'
+        Assert-True (Test-Path -LiteralPath (Join-Path $custom 'unrelated.jpg')) 'Unrelated cache-folder content is preserved'
+        $warm = Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg') @{ CacheFolder = $custom }
+        Assert-True ($warm.CacheHits -eq 1) 'Literal custom path reused'
+    }
+    Test-Case 'NoCache bypasses reads and writes and does not create a cache directory' {
+        $inputPath = New-TestFolder 'cache-disabled'
+        New-TestImage (Join-Path $inputPath 'photo.jpg')
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $uncached = Invoke-TestMosaic $inputPath $output @{ NoCache = $true }
+        Assert-True ($null -eq $uncached.CacheFolder -and $uncached.CacheHits -eq 0 -and $uncached.CacheMisses -eq 0) 'Disabled counters'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $inputPath '.mediamosaic-cache'))) 'No directory created'
+        $cold = Invoke-TestMosaic $inputPath $output
+        $entry = Get-ChildItem -LiteralPath $cold.CacheFolder -File
+        Set-Content -LiteralPath $entry.FullName -Value 'corrupt cache'
+        $before = (Get-FileHash -LiteralPath $entry.FullName).Hash
+        $bypassed = Invoke-TestMosaic $inputPath $output @{ NoCache = $true; RefreshCache = $true }
+        Assert-True ($bypassed.Rendered -eq 1 -and $bypassed.Discovered -eq 1) 'Cache bypassed but still excluded from scan'
+        Assert-True ((Get-FileHash -LiteralPath $entry.FullName).Hash -eq $before) 'Existing cache left untouched'
+    }
+    Test-Case 'RefreshCache rebuilds current entries and corrupt cache files self-heal' {
+        $inputPath = New-TestFolder 'cache-refresh'
+        New-TestImage (Join-Path $inputPath 'photo.jpg')
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $first = Invoke-TestMosaic $inputPath $output
+        $refresh = Invoke-TestMosaic $inputPath $output @{ RefreshCache = $true }
+        Assert-True ($refresh.CacheHits -eq 0 -and $refresh.CacheMisses -eq 1) 'Refresh bypasses cache reads'
+        $entry = Get-ChildItem -LiteralPath $first.CacheFolder -File
+        Set-Content -LiteralPath $entry.FullName -Value 'not PNG'
+        $healed = Invoke-TestMosaic $inputPath $output
+        Assert-True ($healed.Rendered -eq 1 -and $healed.CacheHits -eq 0 -and $healed.CacheMisses -eq 1) 'Corruption rebuilt'
+        $warm = Invoke-TestMosaic $inputPath $output
+        Assert-True ($warm.CacheHits -eq 1) 'Rebuilt entry reusable'
+        Assert-True (@(Get-ChildItem -LiteralPath $first.CacheFolder -Filter '*.tmp').Count -eq 0) 'No temporary writes leaked'
+    }
+    Test-Case 'cache errors warn without turning readable media into failed previews' {
+        $inputPath = New-TestFolder 'cache-errors'
+        New-TestImage (Join-Path $inputPath 'photo.jpg')
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $blocked = Join-Path $inputPath 'blocked-cache'; Set-Content -LiteralPath $blocked -Value 'file blocking directory creation'
+        $warnings = @()
+        $result = Invoke-MediaMosaic -RootFolder $inputPath -OutputFile $output -CacheFolder $blocked -WarningAction SilentlyContinue -WarningVariable warnings
+        Assert-True ($result.Rendered -eq 1 -and $result.Failed -eq 0 -and $null -eq $result.CacheFolder -and $warnings.Count -eq 1) 'Initialization error falls back to uncached rendering'
+        $cold = Invoke-TestMosaic $inputPath $output
+        $entry = Get-ChildItem -LiteralPath $cold.CacheFolder -File
+        Remove-Item -LiteralPath $entry.FullName
+        [IO.Directory]::CreateDirectory($entry.FullName) | Out-Null
+        $warnings = @()
+        $result = Invoke-MediaMosaic -RootFolder $inputPath -OutputFile $output -WarningAction SilentlyContinue -WarningVariable warnings
+        Assert-True ($result.Rendered -eq 1 -and $result.Failed -eq 0 -and $warnings.Count -eq 1) 'Cache write error does not hide the preview'
+        Assert-True (@(Get-ChildItem -LiteralPath $cold.CacheFolder -Filter '*.tmp').Count -eq 0) 'Temporary write cleaned after error'
+    }
+    Test-Case 'cache folders cannot swallow source or output directories' {
+        $inputPath = New-TestFolder 'cache-validation'
+        $output = Join-Path $inputPath 'out\sheet.jpg'
+        Assert-Throws { Invoke-TestMosaic $inputPath $output @{ CacheFolder = $inputPath } } 'dedicated directory'
+        Assert-Throws { Invoke-TestMosaic $inputPath $output @{ CacheFolder = (Join-Path $inputPath 'out') } } 'dedicated directory'
+        Assert-Throws { Invoke-TestMosaic $inputPath $output @{ CacheFolder = $testRoot } } 'dedicated directory'
+    }
+    Test-Case 'discovery does not follow directory junctions outside the source tree' {
+        $inputPath = New-TestFolder 'cache-junction'
+        $outside = New-TestFolder 'junction-target'
+        New-TestImage (Join-Path $inputPath 'source.jpg')
+        New-TestImage (Join-Path $outside 'outside.jpg')
+        $junction = Join-Path $inputPath 'linked'
+        New-Item -ItemType Junction -Path $junction -Target $outside | Out-Null
+        $result = Invoke-TestMosaic $inputPath (Join-Path $inputPath 'sheet.jpg')
+        Assert-True ($result.Discovered -eq 1) 'Nested directory links are not traversed'
+        Assert-True (Test-Path -LiteralPath (Join-Path $outside 'outside.jpg')) 'Linked target is unchanged'
+    }
+    Test-Case 'video and WebP cache hits skip decoder execution, and decoder settings invalidate them' {
+        $inputPath = New-TestFolder 'cache-decoder'
+        foreach ($name in @('clip.mp4', 'image.webp')) { Set-Content -LiteralPath (Join-Path $inputPath $name) -Value 'success' }
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $first = Invoke-TestMosaic $inputPath $output @{ FFmpeg = $decoder }
+        Assert-True ($first.Rendered -eq 2 -and $first.CacheMisses -eq 2) 'Both media types cached'
+        foreach ($name in @('clip.mp4.pid', 'image.webp.pid')) { Remove-Item -LiteralPath (Join-Path $inputPath $name) }
+        $warm = & (Join-Path $repo 'MediaMosaic.ps1') -RootFolder $inputPath -OutputFile $output -FFmpeg $decoder -NoProgress
+        $script:module = Get-Module MediaMosaic
+        Assert-True ($warm.CacheHits -eq 2 -and $warm.CacheMisses -eq 0) 'CLI uses the warmed cache'
+        Assert-True (@(Get-ChildItem -LiteralPath $inputPath -Filter '*.pid').Count -eq 0) 'No decoder was started'
+        $changed = Invoke-MediaMosaic -RootFolder $inputPath -OutputFile $output -FFmpeg 'mediamosaic-missing-decoder' -WarningAction SilentlyContinue
+        Assert-True ($changed.CacheHits -eq 0 -and $changed.Failed -eq 2) 'A changed decoder setting does not reuse stale previews'
+    }
+    Test-Case 'failed previews are not cached and can recover on a later run' {
+        $inputPath = New-TestFolder 'cache-failure'
+        $source = Join-Path $inputPath 'photo.jpg'; Set-Content -LiteralPath $source -Value 'corrupt media'
+        $output = Join-Path $inputPath 'sheet.jpg'
+        $failed = Invoke-MediaMosaic -RootFolder $inputPath -OutputFile $output -WarningAction SilentlyContinue
+        Assert-True ($failed.Failed -eq 1 -and $failed.CacheMisses -eq 1) 'Failure counts as a miss'
+        Assert-True (@(Get-ChildItem -LiteralPath $failed.CacheFolder -File).Count -eq 0) 'No failure placeholder stored in cache'
+        New-TestImage $source
+        $recovered = Invoke-TestMosaic $inputPath $output
+        Assert-True ($recovered.Rendered -eq 1 -and $recovered.CacheMisses -eq 1) 'Repaired media retried'
+    }
     Test-Case 'elapsed progress refreshes while a decoder is still running' {
         $inputPath = New-TestFolder 'progress-decoder'
         $source = Join-Path $inputPath 'hang.webp'; Set-Content -LiteralPath $source -Value 'hang'
@@ -367,7 +519,7 @@ try {
         $before = (Get-FileHash -LiteralPath $first.Sheets[0]).Hash
         Assert-Throws { Invoke-TestMosaic $inputPath $output @{ Columns = 1000; ThumbWidth = 10000 } } 'Canvas is too large'
         Assert-True ((Get-FileHash -LiteralPath $first.Sheets[0]).Hash -eq $before) 'Previous sheet preserved'
-        Assert-True (@(Get-ChildItem -LiteralPath $inputPath -Directory -Force | Where-Object Name -like '.mediamosaic-*').Count -eq 0) 'No staging directories leaked'
+        Assert-True (@(Get-ChildItem -LiteralPath $inputPath -Directory -Force | Where-Object Name -match '^\.mediamosaic-[a-f0-9]{32}$').Count -eq 0) 'No staging directories leaked'
     }
     Test-Case 'manifest cannot delete paths outside its numbered sheet namespace' {
         $inputPath = New-TestFolder 'manifest'

@@ -147,24 +147,128 @@ function Get-PreviewImage {
     return Get-RotatedImage -Path $Path
 }
 
+function Get-CachedPreview {
+    param([IO.FileInfo]$File, [string]$FFmpeg, [int]$FFmpegTimeoutSeconds,
+        [int]$ThumbWidth, [int]$ThumbHeight, [hashtable]$CacheContext, [hashtable]$ProgressContext)
+    if (-not $CacheContext) {
+        return Get-PreviewImage -Path $File.FullName -FFmpeg $FFmpeg `
+            -FFmpegTimeoutSeconds $FFmpegTimeoutSeconds -ProgressContext $ProgressContext
+    }
+    # Refresh filesystem metadata, rather than trusting the discovery snapshot.
+    $source = Get-Item -LiteralPath $File.FullName -ErrorAction Stop
+    $length = $source.Length
+    $modified = $source.LastWriteTimeUtc.Ticks
+    $decoder = if ($source.Extension -match '^\.(webp|mp4|mov|avi|mkv)$') { $FFmpeg.ToUpperInvariant() } else { 'System.Drawing' }
+    # Increment Version whenever preview extraction/orientation/scaling changes.
+    $identity = [ordered]@{
+        Version = 1; Path = $source.FullName.ToUpperInvariant(); Length = $length
+        Modified = $modified; Width = $ThumbWidth; Height = $ThumbHeight; Decoder = $decoder
+    } | ConvertTo-Json -Compress
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { $key = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose() }
+    $cachePath = Join-Path $CacheContext.Folder ($key + '.png')
+    $cached = $null
+    if (-not $CacheContext.Refresh) {
+        try {
+            if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+                $cached = [Drawing.Image]::FromFile($cachePath)
+                if ($cached.Width -gt $ThumbWidth -or $cached.Height -gt $ThumbHeight -or
+                    $cached.RawFormat.Guid -ne [Drawing.Imaging.ImageFormat]::Png.Guid) {
+                    throw 'Cached preview has an invalid format or dimensions.'
+                }
+                # Detach from the file so cache replacement/cleanup never retains a lock.
+                $clone = [Drawing.Bitmap]::new($cached)
+                $CacheContext.Hits++
+                return $clone
+            }
+        }
+        catch { Write-Verbose "Rebuilding unreadable cache entry: $cachePath ($($_.Exception.Message))" }
+        finally { if ($cached) { $cached.Dispose() } }
+    }
+    $CacheContext.Misses++
+    $image = $null
+    $thumbnail = $null
+    $graphics = $null
+    $temporaryFile = $null
+    try {
+        $image = Get-PreviewImage -Path $source.FullName -FFmpeg $FFmpeg `
+            -FFmpegTimeoutSeconds $FFmpegTimeoutSeconds -ProgressContext $ProgressContext
+        $ratio = [Math]::Min($ThumbWidth / [double]$image.Width, $ThumbHeight / [double]$image.Height)
+        $width = [Math]::Max(1, [int]($image.Width * $ratio))
+        $height = [Math]::Max(1, [int]($image.Height * $ratio))
+        $thumbnail = [Drawing.Bitmap]::new($width, $height)
+        $graphics = [Drawing.Graphics]::FromImage($thumbnail)
+        $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.DrawImage($image, [Drawing.Rectangle]::new(0, 0, $width, $height))
+        $graphics.Dispose(); $graphics = $null
+        # Do not save a preview under stale metadata if the source changed mid-read.
+        $source.Refresh()
+        if ($source.Exists -and $source.Length -eq $length -and $source.LastWriteTimeUtc.Ticks -eq $modified) {
+            try {
+                if (Test-Path -LiteralPath $cachePath -PathType Container) { throw 'Cache entry is a directory.' }
+                $temporaryFile = Join-Path $CacheContext.Folder (([guid]::NewGuid().ToString('N')) + '.tmp')
+                $thumbnail.Save($temporaryFile, [Drawing.Imaging.ImageFormat]::Png)
+                Move-Item -LiteralPath $temporaryFile -Destination $cachePath -Force -ErrorAction Stop
+            }
+            catch { Write-Warning "Could not save thumbnail cache entry '$cachePath': $($_.Exception.Message)" }
+        }
+        $result = $thumbnail
+        $thumbnail = $null
+        return $result
+    }
+    finally {
+        if ($graphics) { $graphics.Dispose() }
+        if ($image) { $image.Dispose() }
+        if ($thumbnail) { $thumbnail.Dispose() }
+        if ($temporaryFile -and (Test-Path -LiteralPath $temporaryFile -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $temporaryFile -Force -ErrorAction Continue
+        }
+    }
+}
+
 function Get-MediaFiles {
-    param([string]$Root, [string]$OutputFolder, [string]$BaseName)
+    param([string]$Root, [string]$OutputFolder, [string]$BaseName, [string[]]$ExcludedFolders = @())
+    $excludedPrefixes = @($ExcludedFolders | ForEach-Object { $_.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar })
     $outputPattern = '^' + [regex]::Escape($BaseName) + '-[1-9][0-9]*\.jpg$'
     $stagingPattern = '^' + [regex]::Escape($OutputFolder.TrimEnd('\', '/')) +
         '[\\/]\.mediamosaic-[0-9a-f]{32}[\\/]'
-    Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction Stop |
-        Where-Object {
-            $_.Extension -match '^\.(jpg|jpeg|png|bmp|gif|webp|mp4|mov|avi|mkv)$' -and
-            $_.FullName -notmatch $stagingPattern -and
-            -not ($_.DirectoryName -ieq $OutputFolder -and $_.Name -match $outputPattern)
-        } | Sort-Object -Property FullName
+    # Prune cache directories before traversal, so a large or inaccessible cache
+    # cannot slow down discovery or turn an optional cache into a scanning error.
+    & {
+        $pending = [Collections.Generic.Stack[string]]::new()
+        $pending.Push($Root)
+        while ($pending.Count) {
+            foreach ($entry in (Get-ChildItem -LiteralPath $pending.Pop() -ErrorAction Stop)) {
+                $excluded = $false
+                $candidate = $entry.FullName.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+                foreach ($prefix in $excludedPrefixes) {
+                    if ($candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $excluded = $true; break }
+                }
+                if ($excluded -or $candidate -match $stagingPattern) { continue }
+                if ($entry.PSIsContainer) {
+                    # Do not follow junctions/symlinks into other trees or loops.
+                    $linkType = $entry.PSObject.Properties['LinkType']
+                    if (-not ($linkType -and $linkType.Value -in @('Junction', 'SymbolicLink'))) {
+                        # Cloud-synchronised directories can also be reparse points;
+                        # only actual directory links should be skipped.
+                        $pending.Push($entry.FullName)
+                    }
+                }
+                elseif ($entry.Extension -match '^\.(jpg|jpeg|png|bmp|gif|webp|mp4|mov|avi|mkv)$' -and
+                    -not ($entry.DirectoryName -ieq $OutputFolder -and $entry.Name -match $outputPattern)) {
+                    $entry
+                }
+            }
+        }
+    } | Sort-Object -Property FullName
 }
 
 function Write-ContactSheet {
     param([IO.FileInfo[]]$Files, [string]$Root, [string]$Path, [string]$Title,
         [int]$Sheet, [string]$FFmpeg, [int]$Columns, [int]$ThumbWidth,
         [int]$ThumbHeight, [int]$HeaderHeight, [int]$TextHeight, [int]$Padding,
-        [int]$FFmpegTimeoutSeconds = 30, [hashtable]$ProgressContext)
+        [int]$FFmpegTimeoutSeconds = 30, [hashtable]$ProgressContext, [hashtable]$CacheContext)
     $cellWidth = $ThumbWidth + 2 * $Padding
     $cellHeight = $ThumbHeight + $TextHeight + 2 * $Padding
     $rows = [int][Math]::Ceiling($Files.Count / [double]$Columns)
@@ -200,8 +304,8 @@ function Write-ContactSheet {
             $status = 'Rendered'
             $failure = ''
             try {
-                $image = Get-PreviewImage -Path $file.FullName -FFmpeg $FFmpeg `
-                    -FFmpegTimeoutSeconds $FFmpegTimeoutSeconds -ProgressContext $ProgressContext
+                $image = Get-CachedPreview -File $file -FFmpeg $FFmpeg -FFmpegTimeoutSeconds $FFmpegTimeoutSeconds `
+                    -ThumbWidth $ThumbWidth -ThumbHeight $ThumbHeight -CacheContext $CacheContext -ProgressContext $ProgressContext
                 $ratio = [Math]::Min($ThumbWidth / [double]$image.Width, $ThumbHeight / [double]$image.Height)
                 $newWidth = [Math]::Max(1, [int]($image.Width * $ratio))
                 $newHeight = [Math]::Max(1, [int]($image.Height * $ratio))
@@ -254,6 +358,9 @@ function Invoke-MediaMosaic {
         [ValidateNotNullOrEmpty()][string]$FFmpeg = 'ffmpeg',
         [ValidateRange(1, 3600)][int]$FFmpegTimeoutSeconds = 30,
         [switch]$NoProgress,
+        [ValidateNotNullOrEmpty()][string]$CacheFolder,
+        [switch]$NoCache,
+        [switch]$RefreshCache,
         [ValidateRange(1, 100000)][int]$FilesPerSheet = 200,
         [ValidateRange(1, 1000)][int]$Columns = 4,
         [ValidateRange(1, 10000)][int]$ThumbWidth = 250,
@@ -284,8 +391,24 @@ function Invoke-MediaMosaic {
         }
         $outputFolder = [IO.Path]::GetDirectoryName($outputPath)
         $baseName = [IO.Path]::GetFileNameWithoutExtension($outputPath)
+        $defaultCache = Join-Path $outputFolder '.mediamosaic-cache'
+        $cachePath = if ($CacheFolder) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CacheFolder) } else { $defaultCache }
+        $cachePrefix = $cachePath.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        foreach ($directory in @($root.FullName, $outputFolder)) {
+            if (($directory.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar).StartsWith($cachePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'CacheFolder must be a dedicated directory that does not contain RootFolder or the output directory.'
+            }
+        }
         if (-not (Test-Path -LiteralPath $outputFolder)) { [IO.Directory]::CreateDirectory($outputFolder) | Out-Null }
-        $files = @(Get-MediaFiles -Root $root.FullName -OutputFolder $outputFolder -BaseName $baseName)
+        $files = @(Get-MediaFiles -Root $root.FullName -OutputFolder $outputFolder -BaseName $baseName -ExcludedFolders @($defaultCache, $cachePath))
+        $cacheContext = $null
+        if (-not $NoCache) {
+            try {
+                if ($files.Count) { [IO.Directory]::CreateDirectory($cachePath) | Out-Null }
+                $cacheContext = @{ Folder = $cachePath; Refresh = [bool]$RefreshCache; Hits = 0; Misses = 0 }
+            }
+            catch { Write-Warning "Thumbnail caching disabled for this run: $($_.Exception.Message)" }
+        }
         $progressContext.Total = $files.Count
         $manifestPath = Join-Path $outputFolder "$baseName.mediamosaic.json"
         $oldSheets = @()
@@ -317,6 +440,7 @@ function Invoke-MediaMosaic {
                     ThumbWidth = $ThumbWidth; ThumbHeight = $ThumbHeight; HeaderHeight = $HeaderHeight
                     TextHeight = $TextHeight; Padding = $Padding
                     FFmpegTimeoutSeconds = $FFmpegTimeoutSeconds; ProgressContext = $progressContext
+                    CacheContext = $cacheContext
                 }
                 foreach ($record in (Write-ContactSheet @sheetOptions)) { $records.Add($record) }
                 $sheets.Add($name)
@@ -348,6 +472,9 @@ function Invoke-MediaMosaic {
                 Sheets = @($sheets | ForEach-Object { Join-Path $outputFolder $_ })
                 IndexPath = Join-Path $outputFolder $indexName
                 ManifestPath = $manifestPath
+                CacheFolder = if ($cacheContext) { $cacheContext.Folder } else { $null }
+                CacheHits = if ($cacheContext) { $cacheContext.Hits } else { 0 }
+                CacheMisses = if ($cacheContext) { $cacheContext.Misses } else { 0 }
             }
         }
         finally {
