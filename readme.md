@@ -4,7 +4,11 @@
 
 # MediaMosaic
 
-[![Tests](https://github.com/DanielBrownAG/MediaMosaic/actions/workflows/tests.yml/badge.svg)](https://github.com/DanielBrownAG/MediaMosaic/actions/workflows/tests.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/DanielBrownAG/MediaMosaic/tests.yml?branch=main&label=tests)](https://github.com/DanielBrownAG/MediaMosaic/actions/workflows/tests.yml)
+[![PowerShell 7](https://img.shields.io/badge/PowerShell-7-5391FE)](#requirements)
+[![Windows](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-video%20%26%20WebP-007808)](#supported-media-and-preview-failures)
+[![Last commit](https://img.shields.io/github/last-commit/DanielBrownAG/MediaMosaic/main)](https://github.com/DanielBrownAG/MediaMosaic/commits/main)
 
 Generate JPEG contact sheets from images and videos using PowerShell on Windows.
 MediaMosaic recursively scans a media folder, corrects EXIF orientation, and lays
