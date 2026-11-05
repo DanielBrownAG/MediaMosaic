@@ -1,0 +1,7 @@
+MediaMosaic logo
+Created: 2026-11-05
+Tool: built-in image_gen (transparent background enabled)
+Asset: mediamosaic-logo.png
+
+Final generation prompt:
+Use case: logo-brand. Asset type: final horizontal open-source project logo for a GitHub README. Create an original polished MediaMosaic logo: a compact mosaic of rounded media thumbnail tiles forming a distinctive M-like mark, with one subtle play-triangle tile, paired with the exact wordmark "MediaMosaic" in crisp modern geometric sans-serif lettering. Communicate arranging photographs and videos into contact sheets. Clean flat vector-like graphic, precise spacing, restrained colorful tile accents, confident and practical developer-tool identity. Wide horizontal composition with generous clear margins, mark and wordmark large and legible at README width 440 pixels. Make the wordmark medium blue for readability against both light and dark backgrounds. Text verbatim: "MediaMosaic". No tagline, no mockup, no shadows, no 3D, no watermark, no extra text. Genuinely transparent background, preserve alpha.

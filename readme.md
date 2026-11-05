@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/mediamosaic-logo.png" alt="MediaMosaic — a mosaic of photo and video tiles" width="520">
+</p>
+
 # MediaMosaic
 
 Generate JPEG contact sheets from images and videos using PowerShell on Windows.
@@ -5,7 +9,22 @@ MediaMosaic recursively scans a media folder, corrects EXIF orientation, and lay
 out previews with captions showing paths relative to the source folder. Large
 collections are split into numbered sheets, with 200 files per sheet by default.
 
-![Example contact sheet](ContactImageSheet-1.jpg)
+Use it to review project photography, audit mixed media collections, or prepare
+a visual index for dataset review. Each run produces numbered JPEG sheets, a
+CSV index, and a manifest for cleaning up obsolete sheets on subsequent runs.
+
+## Quick start
+
+```powershell
+git clone https://github.com/DanielBrownAG/MediaMosaic.git
+Set-Location MediaMosaic
+
+# Image-only collections need no FFmpeg installation.
+.\MediaMosaic.ps1 -RootFolder 'D:\Photos' -OutputFile '.\Review\ProjectPhotos.jpg'
+```
+
+Keep `MediaMosaic.ps1` and `MediaMosaic.psm1` together. The script loads the module
+relative to its own location, so you can also invoke it from another directory.
 
 ## Requirements
 
@@ -17,6 +36,7 @@ collections are split into numbered sheets, with 200 files per sheet by default.
   need downloading before they can be decoded.
 
 The regression suite has been run on Windows with PowerShell 5.1 and 7.6.9.
+macOS and Linux are not supported by the current Windows drawing implementation.
 
 ## Usage
 
@@ -76,14 +96,22 @@ interactive input; its exit status, output file, and diagnostics are checked.
 Temporary preview files are removed and image/drawing resources are disposed
 on both success and failure.
 
-A corrupt, unreadable, or unsupported media file keeps its grid position and
+A corrupt or unreadable file with a supported extension keeps its grid position and
 caption with a **PREVIEW FAILED** placeholder. Missing FFmpeg affects only media
 that require it. Each failed preview emits a warning with the path and error;
 processing continues. Headers show separate rendered and failed counts.
+Files with extensions outside the supported list are ignored during discovery.
 
 Files are sorted by full path before pagination. Captions show relative paths
 and use ellipsis when the caption area is too small; the CSV contains the full
 relative path, so identical filenames in different folders remain identifiable.
+
+## Example sheet
+
+![Example contact sheet](ContactImageSheet-1.jpg)
+
+This is an example from the original version. Current output includes relative
+paths in captions and separate rendered/failed counts in the header.
 
 ## Outputs and reruns
 
@@ -128,6 +156,21 @@ multiple files is not an atomic transaction: a filesystem error during publishin
 can leave a partially updated set. Avoid simultaneous runs using the same output
 base. Keep the manifest alongside the sheets for reliable cleanup.
 
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Video or WebP cells show `PREVIEW FAILED` | Run `ffmpeg -version`, or pass the full executable path with `-FFmpeg`. Inspect the CSV `Error` column for decoder details. |
+| Photos fail to load | Confirm the source is readable and cloud files are downloaded locally; inspect the warning and CSV error for the affected path. |
+| No files are discovered | Check the source path and supported extensions. Generated numbered sheets in the output directory are deliberately excluded. |
+| Canvas is too large | Reduce `FilesPerSheet`, `Columns`, or thumbnail dimensions. |
+| A rerun leaves old pages | Only surplus pages recorded in the manifest are removed. Outputs from the original version may need manual cleanup. |
+
+The current implementation processes files sequentially and regenerates previews
+on each run. FFmpeg has no timeout, so a stalled decoder may require interrupting
+the run. Progress reporting, thumbnail caching, filters, an HTML gallery, and
+video storyboards are not implemented.
+
 ## Automation
 
 The script returns one summary object:
@@ -157,7 +200,7 @@ Invoke-MediaMosaic -RootFolder 'D:\Photos' -OutputFile '.\Review\Project.jpg'
 
 ## Tests
 
-The regression suite requires no Pester installation or downloaded test packages.
+The 21-case regression suite requires no Pester installation or downloaded test packages.
 It creates its own fixtures in a unique temporary directory and removes them
 afterwards. FFmpeg integration tests generate real videos and WebP images.
 
@@ -176,6 +219,18 @@ literal and relative paths, invalid options, missing directories, corrupt media,
 short clips, WebP, EXIF rotation and mirroring, pagination, duplicate filenames,
 output exclusion, manifest cleanup and validation, empty input, resource cleanup,
 and preservation of existing sheets when generation fails.
+Tests are run locally with the commands above; this repository does not currently
+include a GitHub Actions workflow.
+
+## Project files
+
+| Path | Purpose |
+| --- | --- |
+| `MediaMosaic.ps1` | Command-line entry point and parameter validation |
+| `MediaMosaic.psm1` | Discovery, preview decoding, sheet rendering, and output management |
+| `tests/Run-Tests.ps1` | Regression suite and generated media fixtures |
+| `assets/mediamosaic-logo.png` | Transparent project logo |
+| `assets/mediamosaic-logo-prompt.txt` | Logo generation prompt and provenance |
 
 ## License
 
