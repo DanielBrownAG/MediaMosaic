@@ -9,6 +9,7 @@
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-video%20%26%20WebP-007808)](#supported-media-and-preview-failures)
 [![Last commit](https://img.shields.io/github/last-commit/DanielBrownAG/MediaMosaic/main)](https://github.com/DanielBrownAG/MediaMosaic/commits/main)
+[![License: MIT](https://img.shields.io/github/license/DanielBrownAG/MediaMosaic)](LICENSE)
 
 Generate JPEG contact sheets from images and videos using PowerShell on Windows.
 MediaMosaic recursively scans a media folder, corrects EXIF orientation, and lays
@@ -347,4 +348,4 @@ reading repository contents.
 
 ## License
 
-MIT License.
+Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Daniel Brown.
